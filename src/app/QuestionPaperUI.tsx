@@ -14,7 +14,7 @@ interface Question {
     option_c: string | null;
     option_d: string | null;
     question_type: string;
-    module: number | null;
+    module: string | null;
 }
 
 interface ExtractionData {
@@ -30,6 +30,138 @@ interface ExtractionData {
 }
 
 type InputMode = 'api' | 'direct';
+
+// Helper function to escape dollar signs that are not LaTeX delimiters
+const escapeCurrencyInText = (text: string): string => {
+    // This function escapes single $ that are used for currency (e.g., $100, $1,000)
+    // but preserves $$ for LaTeX block math and $$...$$ for inline math
+    
+    // First, protect existing $$ delimiters by temporarily replacing them
+    const protectedText = text.replace(/\$\$/g, '<<<DOUBLEDOLLAR>>>');
+    
+    // Now escape single $ that appear before numbers (currency)
+    const escaped = protectedText.replace(/\$(?=[\d])/g, '\\$');
+    
+    // Restore the $$ delimiters
+    return escaped.replace(/<<<DOUBLEDOLLAR>>>/g, '$$');
+};
+
+// Helper function to detect and parse table-like data
+const parseTableData = (text: string): { isTable: boolean; data?: { headers: string[]; rows: string[][] } } => {
+    // Trim the text first
+    const trimmedText = text.trim();
+    
+    // Check for semicolon-separated key-value pairs pattern: "X: val1, val2, val3; Y: val4, val5, val6"
+    const hasSemicolons = trimmedText.includes(';') && trimmedText.includes(':');
+    
+    if (hasSemicolons) {
+        try {
+            const parts = trimmedText.split(';').map(p => p.trim()).filter(p => p.length > 0);
+            const headers: string[] = [];
+            const values: string[][] = [];
+            
+            // Parse each part
+            for (const part of parts) {
+                const colonIndex = part.indexOf(':');
+                if (colonIndex === -1) continue;
+                
+                const header = part.substring(0, colonIndex).trim();
+                const valueString = part.substring(colonIndex + 1).trim();
+                
+                // Split values by comma
+                const vals = valueString.split(',').map(v => v.trim()).filter(v => v.length > 0);
+                
+                if (vals.length > 0) {
+                    headers.push(header);
+                    vals.forEach((val, idx) => {
+                        if (!values[idx]) values[idx] = [];
+                        values[idx].push(val);
+                    });
+                }
+            }
+            
+            // Check if we have valid table data
+            if (headers.length > 0 && values.length > 0) {
+                // Ensure all rows have the same number of columns
+                const maxCols = headers.length;
+                const normalizedRows = values.map(row => {
+                    while (row.length < maxCols) row.push('');
+                    return row.slice(0, maxCols);
+                });
+                
+                return { isTable: true, data: { headers, rows: normalizedRows } };
+            }
+        } catch (error) {
+            console.error('Error parsing table data:', error);
+        }
+    }
+    
+    return { isTable: false };
+};
+
+// Helper function to render option content (either as table or markdown)
+const OptionContent = ({ text }: { text: string }) => {
+    const tableInfo = parseTableData(text);
+    
+    if (tableInfo.isTable && tableInfo.data) {
+        return (
+            <div className="overflow-x-auto">
+                <table className="min-w-full border-collapse border border-gray-300 my-2">
+                    <thead className="bg-gray-100">
+                        <tr>
+                            {tableInfo.data.headers.map((header, idx) => (
+                                <th key={idx} className="border border-gray-300 px-4 py-2 text-left font-semibold">
+                                    <ReactMarkdown
+                                        remarkPlugins={[remarkMath]}
+                                        rehypePlugins={[rehypeKatex]}
+                                    >
+                                        {header}
+                                    </ReactMarkdown>
+                                </th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {tableInfo.data.rows.map((row, rowIdx) => (
+                            <tr key={rowIdx} className="hover:bg-gray-50">
+                                {row.map((cell, cellIdx) => (
+                                    <td key={cellIdx} className="border border-gray-300 px-4 py-2">
+                                        <ReactMarkdown
+                                            remarkPlugins={[remarkMath]}
+                                            rehypePlugins={[rehypeKatex]}
+                                        >
+                                            {cell}
+                                        </ReactMarkdown>
+                                    </td>
+                                ))}
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        );
+    }
+    
+    return (
+        <ReactMarkdown
+            remarkPlugins={[remarkMath]}
+            rehypePlugins={[rehypeKatex]}
+            components={{
+                p: ({node, ...props}) => <span {...props} />,
+                code: ({node, ...props}) => {
+                    const isInline = !props.className;
+                    return isInline ? (
+                        <code className="bg-gray-100 px-1 py-0.5 rounded text-xs" {...props} />
+                    ) : (
+                        <code className="block bg-gray-100 p-2 rounded text-xs overflow-x-auto" {...props} />
+                    );
+                },
+            }}
+        >
+            {text}
+        </ReactMarkdown>
+    );
+};
 
 export default function QuestionPaperUI() {
     const [questions, setQuestions] = useState<Question[]>([]);
@@ -163,16 +295,28 @@ export default function QuestionPaperUI() {
                 throw new Error('Invalid JSON structure. Expected format: { "data": { "questions": [...] } } or { "questions": [...] }');
             }
 
-            const mappedQuestions: Question[] = questionsData.map((q: any) => ({
-                question_no: q.question_no || 0,
-                question: q.question_text || q.question || '',
-                option_a: q.option_a || null,
-                option_b: q.option_b || null,
-                option_c: q.option_c || null,
-                option_d: q.option_d || null,
-                question_type: q.question_type || 'multiple_choice',
-                module: q.module || null,
-            }));
+            const mappedQuestions: Question[] = questionsData.map((q: any) => {
+                // Parse module - handle both "Module 1" and "Module Module 1" formats
+                let moduleValue: string | null = null;
+                if (q.module) {
+                    if (typeof q.module === 'string') {
+                        moduleValue = q.module;
+                    } else if (typeof q.module === 'number') {
+                        moduleValue = `Module ${q.module}`;
+                    }
+                }
+                
+                return {
+                    question_no: q.question_no || 0,
+                    question: q.question_text || q.question || '',
+                    option_a: q.option_a || null,
+                    option_b: q.option_b || null,
+                    option_c: q.option_c || null,
+                    option_d: q.option_d || null,
+                    question_type: q.question_type || 'multiple_choice',
+                    module: moduleValue,
+                };
+            });
 
             if (mappedQuestions.length === 0) {
                 throw new Error('No questions found in the provided data');
@@ -358,7 +502,7 @@ export default function QuestionPaperUI() {
                                         </span>
                                         {question.module !== null && (
                                             <span className="text-xs sm:text-sm px-3 py-1 bg-purple-100 text-purple-800 rounded font-semibold">
-                                                Module {question.module}
+                                                {question.module}
                                             </span>
                                         )}
                                         <span className={`text-xs px-3 py-1 rounded font-semibold ${
@@ -395,15 +539,35 @@ export default function QuestionPaperUI() {
                                         tr: ({node, ...props}) => (
                                             <tr className="hover:bg-gray-50" {...props} />
                                         ),
-                                        code: ({node, inline, ...props}) => 
-                                            inline ? (
+                                        tbody: ({node, ...props}) => (
+                                            <tbody {...props} />
+                                        ),
+                                        ul: ({node, ...props}) => (
+                                            <ul className="list-disc pl-6 my-2" {...props} />
+                                        ),
+                                        ol: ({node, ...props}) => (
+                                            <ol className="list-decimal pl-6 my-2" {...props} />
+                                        ),
+                                        li: ({node, ...props}) => (
+                                            <li className="mb-1" {...props} />
+                                        ),
+                                        code: ({node, ...props}) => {
+                                            const isInline = !props.className;
+                                            return isInline ? (
                                                 <code className="bg-gray-100 px-1 py-0.5 rounded text-sm" {...props} />
                                             ) : (
                                                 <code className="block bg-gray-100 p-2 rounded text-sm overflow-x-auto" {...props} />
-                                            )
+                                            );
+                                        },
+                                        strong: ({node, ...props}) => (
+                                            <strong className="font-bold" {...props} />
+                                        ),
+                                        em: ({node, ...props}) => (
+                                            <em className="italic" {...props} />
+                                        ),
                                     }}
                                 >
-                                    {question.question}
+                                    {escapeCurrencyInText(question.question)}
                                 </ReactMarkdown>
                             </div>
 
@@ -413,12 +577,7 @@ export default function QuestionPaperUI() {
                                         <div className="flex items-start gap-2 sm:gap-3 p-2.5 sm:p-3 border border-gray-300 rounded hover:bg-blue-50 transition">
                                             <span className="font-bold text-blue-500 min-w-6 text-sm sm:text-base">A.</span>
                                             <div className="text-gray-800 text-sm leading-relaxed prose prose-sm max-w-none flex-1 markdown-content">
-                                                <ReactMarkdown
-                                                    remarkPlugins={[remarkMath]}
-                                                    rehypePlugins={[rehypeKatex]}
-                                                >
-                                                    {question.option_a}
-                                                </ReactMarkdown>
+                                                <OptionContent text={question.option_a} />
                                             </div>
                                         </div>
                                     )}
@@ -426,12 +585,7 @@ export default function QuestionPaperUI() {
                                         <div className="flex items-start gap-2 sm:gap-3 p-2.5 sm:p-3 border border-gray-300 rounded hover:bg-blue-50 transition">
                                             <span className="font-bold text-blue-500 min-w-6 text-sm sm:text-base">B.</span>
                                             <div className="text-gray-800 text-sm leading-relaxed prose prose-sm max-w-none flex-1 markdown-content">
-                                                <ReactMarkdown
-                                                    remarkPlugins={[remarkMath]}
-                                                    rehypePlugins={[rehypeKatex]}
-                                                >
-                                                    {question.option_b}
-                                                </ReactMarkdown>
+                                                <OptionContent text={question.option_b} />
                                             </div>
                                         </div>
                                     )}
@@ -439,12 +593,7 @@ export default function QuestionPaperUI() {
                                         <div className="flex items-start gap-2 sm:gap-3 p-2.5 sm:p-3 border border-gray-300 rounded hover:bg-blue-50 transition">
                                             <span className="font-bold text-blue-500 min-w-6 text-sm sm:text-base">C.</span>
                                             <div className="text-gray-800 text-sm leading-relaxed prose prose-sm max-w-none flex-1 markdown-content">
-                                                <ReactMarkdown
-                                                    remarkPlugins={[remarkMath]}
-                                                    rehypePlugins={[rehypeKatex]}
-                                                >
-                                                    {question.option_c}
-                                                </ReactMarkdown>
+                                                <OptionContent text={question.option_c} />
                                             </div>
                                         </div>
                                     )}
@@ -452,12 +601,7 @@ export default function QuestionPaperUI() {
                                         <div className="flex items-start gap-2 sm:gap-3 p-2.5 sm:p-3 border border-gray-300 rounded hover:bg-blue-50 transition">
                                             <span className="font-bold text-blue-500 min-w-6 text-sm sm:text-base">D.</span>
                                             <div className="text-gray-800 text-sm leading-relaxed prose prose-sm max-w-none flex-1 markdown-content">
-                                                <ReactMarkdown
-                                                    remarkPlugins={[remarkMath]}
-                                                    rehypePlugins={[rehypeKatex]}
-                                                >
-                                                    {question.option_d}
-                                                </ReactMarkdown>
+                                                <OptionContent text={question.option_d} />
                                             </div>
                                         </div>
                                     )}
@@ -477,6 +621,11 @@ export default function QuestionPaperUI() {
             </div>
 
             <style jsx global>{`
+                .markdown-content {
+                    word-wrap: break-word;
+                    overflow-wrap: break-word;
+                    word-break: break-word;
+                }
                 .markdown-content .katex {
                     font-size: 1.1em;
                 }
@@ -487,9 +636,37 @@ export default function QuestionPaperUI() {
                 }
                 .markdown-content p {
                     line-height: 1.8;
+                    white-space: pre-wrap;
                 }
                 .markdown-content p:last-child {
                     margin-bottom: 0;
+                }
+                .markdown-content table {
+                    border-collapse: collapse;
+                    width: 100%;
+                    margin: 1em 0;
+                }
+                .markdown-content table th,
+                .markdown-content table td {
+                    border: 1px solid #d1d5db;
+                    padding: 0.5rem 1rem;
+                    text-align: left;
+                }
+                .markdown-content table th {
+                    background-color: #f3f4f6;
+                    font-weight: 600;
+                }
+                .markdown-content table tr:hover {
+                    background-color: #f9fafb;
+                }
+                .markdown-content ul,
+                .markdown-content ol {
+                    margin-left: 1.5rem;
+                    margin-top: 0.5rem;
+                    margin-bottom: 0.5rem;
+                }
+                .markdown-content li {
+                    margin-bottom: 0.25rem;
                 }
             `}</style>
         </div>
